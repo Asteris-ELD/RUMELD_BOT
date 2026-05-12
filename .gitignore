@@ -1,0 +1,10 @@
+.env
+chats.json
+users.json
+*.migrated
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.claude/
