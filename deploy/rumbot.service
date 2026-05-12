@@ -1,0 +1,17 @@
+[Unit]
+Description=RumBot Telegram bot
+After=network.target
+
+[Service]
+Type=simple
+User=rumbot
+Group=rumbot
+WorkingDirectory=/home/rumbot/RUMELD_BOT
+ExecStart=/home/rumbot/RUMELD_BOT/.venv/bin/python /home/rumbot/RUMELD_BOT/bot.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
