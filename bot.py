@@ -88,6 +88,82 @@ APP_LINKS_MESSAGE = (
     "https://play.google.com/store/apps/details?id=com.safelane.eld - ANDROID"
 )
 
+# ───────────────────────────────────────────────────────────────────────────
+#  ДОП. ТЕКСТЫ В КОНЦЕ /welcome  ←  ВСТАВЛЯЙ СВОИ ТЕКСТЫ ЗДЕСЬ
+# ───────────────────────────────────────────────────────────────────────────
+# Эти тексты уходят ПОСЛЕДНИМИ в /welcome (после приветствия, ссылок и PDF),
+# по одному сообщению на каждый элемент списка, сверху вниз, во все чаты
+# одинаково (язык НЕ учитывается).
+#
+# • Это ОБЫЧНЫЙ текст — вставляй что угодно: эмодзи, значки, любые символы
+#   (< > & и т.п.). Экранировать ничего НЕ нужно.
+# • Слишком длинный текст бот сам порежет на части по границам строк
+#   (лимит Telegram — 4096 символов на сообщение).
+# • Пустой список = ничего лишнего не отправляется.
+#
+# Каждый текст бери в тройные кавычки """...""", элементы разделяй запятой.
+# ВАЖНО: пиши строки БЕЗ отступа слева, иначе пробелы попадут в сообщение.
+#
+# Пример:
+#     EXTRA_WELCOME_MESSAGES = [
+# """🚛✅ ВНИМАНИЕ ВОДИТЕЛИ!
+# Первый большой текст со значками 📲🔴
+# может быть на много строк.""",
+# """Второй текст 🕐
+# тоже отправится отдельным сообщением.""",
+#     ]
+EXTRA_WELCOME_MESSAGES: list[str] = [
+"""🚨 HIGH RISK ALERT — READ CAREFULLY 🚨
+
+📸 LPR WARNING
+LPR (License Plate Recognition) cameras scan your plate and track truck movement.
+❗️ ELD logs must match real travel history → mismatch may cause HOS violation
+⚠️LPR HIGH-RISK AREAS :
+📍ARIZONA
+• Kingman — (35.2123108, -113.9735641)
+• St. David — (31.9883076, -110.1885575)
+• Chandler — (33.2565727, -111.9493027)
+• Phoenix — (33.3511581, -112.1908264)
+• Littlefield — (36.9806633, -113.6454697)
+• Doney Park  — (35.2123146, -111.5342026)
+📍MISSOURI
+• Mayview — (39.0037384, -93.8533554)
+• Danville — (38.9111176, -91.7027893)
+• Boonville — (38.9334450, -92.7803574)
+📍NEBRASKA
+• Hebron  — (40.0963050, -97.6140407)
+
+📑 BOL & FUEL RECEIPT WARNING
+⚠️ Some locations perform deep 8-day review of:
+• BOLs
+• Fuel receipts
+• ELD logs
+
+⚠️ DEEP CHECK AREAS
+📍OREGON
+• Ashland — POE (42.2222099, -122.7226715)
+• Woodburn — Scale (45.1753289, -122.8547710)
+• Umatilla — POE (45.9192215, -119.3278938)
+• Salem — Hwy Patrol 
+📍IOWA
+• Colfax  (8-day BOL & fuel check)
+
+✅ If routed through these areas → notify ELD team immediately
+⚠️Avoid these locations when possible.
+
+📌 DOCUMENT RULES
+
+✅ Show ONLY fixed BOL
+❗️Do NOT show original BOL
+❗️Do NOT show fuel receipts
+❗️Do NOT show Relay app
+❗️Do NOT give your phone to inspectors or allow them to check your relay app.
+❗️Do NOT provide any Love's receipts during inspections.
+
+These instructions are very important. Please make sure you understand them and follow them during any inspection.
+If you have any questions, let us know""",
+]
+
 WELCOME_FILES_DIR = Path(__file__).parent / "welcome_files"
 WELCOME_PDFS = [
     "Safe Lane ELD - DOT Instruction Sheet ✅.pdf",
@@ -96,6 +172,10 @@ WELCOME_PDFS = [
 ]
 
 _pdf_file_ids: dict[str, str] = {}
+
+# Пауза между сообщениями приветствия (сек). Настраивается через .env,
+# чтобы можно было замедлить отправку без правок кода.
+WELCOME_INTER_MSG_DELAY = float(os.getenv("WELCOME_INTER_MSG_DELAY", "1.2"))
 
 LANG_PROMPT = "🌐 Language / Язык:"
 LANG_CONFIRM = {
@@ -548,9 +628,6 @@ def _safe_filename(name: str) -> str:
     return cleaned or "document.pdf"
 
 
-WELCOME_INTER_MSG_DELAY = 1.2
-
-
 async def _safe_send(coro_factory, *, retries: int = 3):
     last_exc: Exception | None = None
     for attempt in range(retries):
@@ -576,6 +653,41 @@ async def _safe_send(coro_factory, *, retries: int = 3):
     if last_exc:
         raise last_exc
     return None
+
+
+TELEGRAM_MAX_MSG_LEN = 4096
+
+
+def _split_message(text: str, limit: int = TELEGRAM_MAX_MSG_LEN) -> list[str]:
+    """Режет длинный текст на части <= limit символов по границам строк,
+    чтобы уложиться в лимит Telegram. Это обычный текст (без HTML-разметки),
+    поэтому резать безопасно. Пустой/пробельный текст -> []."""
+    text = text.strip("\n")
+    if not text.strip():
+        return []
+    if len(text) <= limit:
+        return [text]
+
+    chunks: list[str] = []
+    current = ""
+    for line in text.split("\n"):
+        # Одна строка длиннее лимита — режем её жёстко по символам.
+        while len(line) > limit:
+            if current:
+                chunks.append(current)
+                current = ""
+            chunks.append(line[:limit])
+            line = line[limit:]
+        candidate = line if not current else current + "\n" + line
+        if len(candidate) > limit:
+            if current:
+                chunks.append(current)
+            current = line
+        else:
+            current = candidate
+    if current.strip():
+        chunks.append(current)
+    return chunks
 
 
 async def _send_welcome_pdfs(
@@ -646,26 +758,69 @@ async def cmd_welcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         lang = DEFAULT_LANG
     text = WELCOME_MESSAGES.get(lang, WELCOME_MESSAGES[DEFAULT_LANG])
 
-    await _safe_send(
-        lambda: context.bot.send_message(
-            chat_id=chat.id,
-            text=text,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+    # Best-effort: каждый шаг отправляется независимо, чтобы сбой/флуд-лимит
+    # на одном сообщении не оборвал остальные. _safe_send уже ждёт RetryAfter.
+    failed: list[str] = []
+
+    try:
+        await _safe_send(
+            lambda: context.bot.send_message(
+                chat_id=chat.id,
+                text=text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         )
-    )
+    except TelegramError as e:
+        logger.warning("welcome text failed in %s: %s", chat.id, e)
+        failed.append("текст")
+
     await asyncio.sleep(WELCOME_INTER_MSG_DELAY)
 
-    await _safe_send(
-        lambda: context.bot.send_message(
-            chat_id=chat.id,
-            text=APP_LINKS_MESSAGE,
-            disable_web_page_preview=False,
+    try:
+        await _safe_send(
+            lambda: context.bot.send_message(
+                chat_id=chat.id,
+                text=APP_LINKS_MESSAGE,
+                disable_web_page_preview=False,
+            )
         )
-    )
+    except TelegramError as e:
+        logger.warning("welcome links failed in %s: %s", chat.id, e)
+        failed.append("ссылки")
+
     await asyncio.sleep(WELCOME_INTER_MSG_DELAY)
 
-    await _send_welcome_pdfs(context, chat.id)
+    try:
+        await _send_welcome_pdfs(context, chat.id)
+    except TelegramError as e:
+        logger.warning("welcome pdfs failed in %s: %s", chat.id, e)
+        failed.append("PDF")
+
+    # Доп. тексты (EXTRA_WELCOME_MESSAGES) — уходят самыми последними,
+    # по одному сообщению на элемент списка; длинные режутся на части.
+    for idx, extra in enumerate(EXTRA_WELCOME_MESSAGES, start=1):
+        for part in _split_message(extra or ""):
+            await asyncio.sleep(WELCOME_INTER_MSG_DELAY)
+            try:
+                await _safe_send(
+                    lambda part=part: context.bot.send_message(
+                        chat_id=chat.id,
+                        text=part,
+                        disable_web_page_preview=True,
+                    )
+                )
+            except TelegramError as e:
+                logger.warning(
+                    "welcome extra #%s failed in %s: %s", idx, chat.id, e
+                )
+                failed.append(f"доп.текст #{idx}")
+
+    if failed:
+        try:
+            await message.reply_text("⚠️ Не отправлено: " + ", ".join(failed))
+        except TelegramError:
+            pass
 
 
 @admin_only
