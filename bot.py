@@ -190,6 +190,12 @@ REFRESH_TRIGGERS = {
     "done, refresh please",
     "done, refresh please, update please",
 }
+# Стикеры-триггеры из набора https://t.me/addstickers/eld24for7
+# (сравниваем по file_unique_id — он одинаков у всех отправителей).
+REFRESH_STICKER_IDS = {
+    "AgADi5UAAh5_aUo",  # 🔄 «Refresh please»
+    "AgADVpYAAreHaEo",  # ✅ «Ready ✓»
+}
 
 CHATS_FILE = Path(__file__).parent / "chats.json"
 USERS_FILE = Path(__file__).parent / "users.json"
@@ -1136,9 +1142,15 @@ async def on_refresh_trigger(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     message = update.message
-    if not message or not message.text:
+    if not message:
         return
-    if message.text.strip().lower() not in REFRESH_TRIGGERS:
+    if message.sticker:
+        if message.sticker.file_unique_id not in REFRESH_STICKER_IDS:
+            return
+    elif message.text:
+        if message.text.strip().lower() not in REFRESH_TRIGGERS:
+            return
+    else:
         return
     if not is_admin(update.effective_user):
         return
@@ -1248,7 +1260,8 @@ def main() -> None:
     )
     app.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND & filters.ChatType.GROUPS,
+            ((filters.TEXT & ~filters.COMMAND) | filters.Sticker.ALL)
+            & filters.ChatType.GROUPS,
             on_refresh_trigger,
         )
     )
