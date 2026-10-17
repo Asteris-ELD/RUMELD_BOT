@@ -127,6 +127,14 @@ APP_LINKS_MESSAGE = (
 EXTRA_WELCOME_MESSAGES: list[str] = [
 """🚨 HIGH RISK ALERT — READ CAREFULLY 🚨
 
+⛔️ PROHIBITED STATES ⛔️
+🚫 Oregon (OR)
+🚫 Washington (WA)
+🚫 Idaho (ID)
+🚫 Montana (MT)
+🚫 Arizona (AZ)
+🚫 Wyoming (WY)
+
 📸 LPR WARNING
 LPR (License Plate Recognition) cameras scan your plate and track truck movement.
 ❗️ ELD logs must match real travel history → mismatch may cause HOS violation
