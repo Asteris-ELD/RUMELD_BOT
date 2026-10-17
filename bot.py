@@ -5,17 +5,21 @@ import json
 import logging
 import os
 import re
+import secrets
+import time
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from dotenv import load_dotenv
 from supabase import Client, create_client
 from telegram import (
+    Chat,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InputFile,
     InputMediaDocument,
     KeyboardButton,
+    Message,
     ReplyKeyboardMarkup,
     Update,
     User,
@@ -52,6 +56,14 @@ ADMIN_USERNAMES = {
 }
 ADMIN_IDS = {
     int(x) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip().isdigit()
+}
+# /inactive — отдельный, более узкий список (не ADMIN_USERNAMES).
+INACTIVE_USERNAMES = {
+    name.strip().lstrip("@").lower()
+    for name in os.getenv(
+        "INACTIVE_USERNAMES", "rum_support1,rum_support2,rumeld"
+    ).split(",")
+    if name.strip()
 }
 
 DEFAULT_LANG = "ru"
@@ -360,6 +372,26 @@ async def forget_chat(chat_id: int) -> None:
 
 async def get_chats() -> set[int]:
     return set(_chats_cache)
+
+
+async def fetch_group_titles() -> dict[int, str]:
+    """chat_id -> title для всех групп, где бот сейчас состоит.
+    Названия берём из Supabase (в кэше только id)."""
+    def _sync():
+        resp = (
+            sb.table("chats")
+            .select("chat_id, title")
+            .in_("type", ["group", "supergroup"])
+            .execute()
+        )
+        return resp.data or []
+
+    rows = await asyncio.to_thread(_sync)
+    return {
+        row["chat_id"]: row["title"]
+        for row in rows
+        if row.get("title") and row["chat_id"] in _chats_cache
+    }
 
 
 # --- Storage: refresh events (analytics) ---------------------------------
@@ -908,7 +940,12 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/welcome — send welcome (text + app links + 3 PDFs)\n"
         "/language /lang — change language (RU / EN)\n"
         "/dot [day] — mark group title with DOT date\n"
+        "/inactive — prefix group title with ❌ INACTIVE ❌ "
+        "(rum_support1, rum_support2, rumeld only)\n"
         "/broadcast <text> — broadcast to all chats\n"
+        "/bc <company>[, company…] + text on next line (or as reply) — "
+        "broadcast to groups whose title contains the company\n"
+        "/companies — companies found in group titles\n"
         "/stats [days] — refresh-ping statistics (default 7 days)\n"
         "/chats — count of chats bot is in\n"
         "/myid — your user_id\n"
@@ -927,8 +964,12 @@ async def _do_broadcast(
     sender_id: int,
     sender_name: str,
     status_msg,
+    chat_ids: set[int] | None = None,
+    label: str = "",
 ) -> None:
-    chats = await get_chats()
+    """chat_ids=None — во все чаты; иначе только в переданные.
+    label — подпись к итогу (например, «по компании BAF»)."""
+    chats = await get_chats() if chat_ids is None else set(chat_ids)
     sent = failed = removed = 0
 
     for chat_id in chats:
@@ -981,12 +1022,14 @@ async def _do_broadcast(
         await asyncio.sleep(0.05)
 
     logger.info(
-        "Broadcast от @%s (id=%s) завершён: ok=%s fail=%s removed=%s total=%s",
+        "Broadcast%s от @%s (id=%s) завершён: ok=%s fail=%s removed=%s total=%s",
+        f" [{label}]" if label else "",
         sender_name, sender_id, sent, failed, removed, len(chats),
     )
     try:
         await status_msg.edit_text(
-            f"📣 Рассылка завершена (от @{sender_name}).\n"
+            f"📣 Рассылка{' ' + label if label else ''} завершена "
+            f"(от @{sender_name}).\n"
             f"✅ Отправлено: {sent}\n"
             f"❌ Ошибок: {failed}\n"
             f"🗑 Удалено: {removed}\n"
@@ -1041,9 +1084,256 @@ async def cmd_broadcast(
     asyncio.create_task(run())
 
 
+# --- Broadcast by company (/bc, /companies) ------------------------------
+#
+# Отдельного поля «компания» у чата нет — компания зашита в название группы:
+# «Водитель |#трак| КОМПАНИЯ» (написание плавает: «BAF TRANS», «BAF
+# Transportation INC», «DON CAR-LEONE»...). Поэтому выбираем группы по
+# ключевым словам в названии, показываем найденное и шлём только после
+# подтверждения кнопкой.
+
+BC_PENDING_TTL = 15 * 60          # сек. — сколько живёт неподтверждённая рассылка
+BC_PREVIEW_LIMIT = 40             # сколько названий групп показать в превью
+COMPANY_SUFFIXES = {"LLC", "INC", "CORP", "CO", "LTD"}
+
+_bc_pending: dict[str, dict] = {}
+
+
+def _norm_words(text: str) -> str:
+    """'DON CAR-LEONE LLC' -> 'DON CAR LEONE LLC' (без эмодзи и пунктуации)."""
+    return " ".join(re.sub(r"[\W_]+", " ", text).upper().split())
+
+
+def title_matches(title: str, keywords: list[str]) -> bool:
+    """Совпадение по целым словам: 'BAF' найдёт 'BAF TRANS', но не 'BAFFIN'."""
+    padded = f" {_norm_words(title)} "
+    return any(f" {kw} " in padded for kw in keywords)
+
+
+def company_from_title(title: str) -> str:
+    """Хвост названия после номера трака, без LLC/INC. Эвристика — только
+    для подсказки в /companies, рассылка по ней не фильтрует."""
+    t = DOT_PREFIX_RE.sub("", INACTIVE_PREFIX_RE.sub("", title))
+    if "|" in t:
+        tail = t.rsplit("|", 1)[1]
+    else:
+        m = re.search(r"#\S*\s+(.+)$", t)
+        tail = m.group(1) if m else ""
+    words = _norm_words(tail).split()
+    # Хвост номера трака («#14 I FFJ…», «# 001 APZ…») — не часть компании.
+    while words and (words[0].isdigit() or words[0] == "I"):
+        words.pop(0)
+    while words and words[-1] in COMPANY_SUFFIXES:
+        words.pop()
+    return " ".join(words)
+
+
+def parse_bc_keywords(raw: str) -> list[str]:
+    return [kw for kw in (_norm_words(p) for p in raw.split(",")) if kw]
+
+
+def _bc_cleanup() -> None:
+    now = time.monotonic()
+    for token in [t for t, p in _bc_pending.items() if p["expires"] < now]:
+        del _bc_pending[token]
+
+
+@admin_only
+async def cmd_companies(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if not message:
+        return
+    try:
+        titles = await fetch_group_titles()
+    except Exception:
+        logger.exception("fetch_group_titles failed")
+        await message.reply_text("❌ Не удалось загрузить список групп.")
+        return
+
+    counts: dict[str, int] = {}
+    for title in titles.values():
+        name = company_from_title(title) or "?"
+        counts[name] = counts.get(name, 0) + 1
+
+    lines = [
+        f"🏢 <b>Компании в названиях групп</b> ({len(titles)} групп)",
+        "<i>Варианты написания одной компании идут отдельно — "
+        "для /bc бери общее слово (например BAF).</i>",
+        "",
+    ]
+    for name, n in sorted(counts.items()):
+        lines.append(f"{html.escape(name)} — {n}")
+
+    for part in _split_message("\n".join(lines)):
+        await message.reply_text(part, parse_mode=ParseMode.HTML)
+
+
+@admin_only
+async def cmd_bc(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    if not message or not message.text:
+        return
+
+    # Первая строка: «/bc BAF, DMS»; текст — со второй строки или из
+    # сообщения, на которое ответили командой.
+    first_line, _, _ = message.text.partition("\n")
+    keywords = parse_bc_keywords(first_line.partition(" ")[2])
+
+    _, sep, body_html = (message.text_html or "").partition("\n")
+    text = body_html.strip() if sep else ""
+    if not text and message.reply_to_message:
+        text = (
+            message.reply_to_message.text_html
+            or message.reply_to_message.text
+            or ""
+        )
+
+    if not keywords or not text:
+        await message.reply_text(
+            "Рассылка по компаниям — в группы, где в названии есть слово:\n"
+            "  /bc BAF\n"
+            "  текст с новой строки\n"
+            "или ответь на сообщение командой /bc BAF\n"
+            "Несколько компаний — через запятую: /bc BAF, DMS\n"
+            "Список компаний из названий групп — /companies"
+        )
+        return
+
+    try:
+        titles = await fetch_group_titles()
+    except Exception:
+        logger.exception("fetch_group_titles failed")
+        await message.reply_text("❌ Не удалось загрузить список групп.")
+        return
+
+    targets = {
+        cid: title
+        for cid, title in titles.items()
+        if cid != REFRESH_GROUP_ID and title_matches(title, keywords)
+    }
+    kw_label = ", ".join(keywords)
+    if not targets:
+        await message.reply_text(
+            f"🔍 Не нашёл групп со словом «{kw_label}» в названии.\n"
+            "Проверь написание через /companies."
+        )
+        return
+
+    _bc_cleanup()
+    token = secrets.token_hex(4)
+    user = update.effective_user
+    _bc_pending[token] = {
+        "chat_ids": set(targets),
+        "text": text,
+        "label": f"по «{kw_label}»",
+        "admin_id": user.id if user else 0,
+        "expires": time.monotonic() + BC_PENDING_TTL,
+    }
+
+    sorted_titles = sorted(targets.values(), key=str.lower)
+    lines = [
+        f"📣 <b>Рассылка по «{html.escape(kw_label)}»</b>, "
+        f"найдено групп: {len(targets)}",
+        "",
+    ]
+    lines += [f"• {html.escape(t)}" for t in sorted_titles[:BC_PREVIEW_LIMIT]]
+    if len(sorted_titles) > BC_PREVIEW_LIMIT:
+        lines.append(f"… и ещё {len(sorted_titles) - BC_PREVIEW_LIMIT}")
+    lines += ["", "Отправить?"]
+
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Отправить", callback_data=f"bc:ok:{token}"),
+            InlineKeyboardButton("❌ Отмена", callback_data=f"bc:no:{token}"),
+        ]]
+    )
+    await message.reply_text(
+        "\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=keyboard
+    )
+
+
+@admin_only
+async def on_bc_button(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    if not query or not query.data:
+        return
+    _, action, token = query.data.split(":", 2)
+
+    _bc_cleanup()
+    pending = _bc_pending.get(token)
+    if not pending:
+        await query.answer("Рассылка устарела — запусти /bc заново.", show_alert=True)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except BadRequest:
+            pass
+        return
+
+    user = query.from_user
+    if pending["admin_id"] and user and user.id != pending["admin_id"]:
+        await query.answer("Подтвердить может только тот, кто запустил.", show_alert=True)
+        return
+
+    if action == "no":
+        del _bc_pending[token]
+        await query.answer("Отменено")
+        try:
+            await query.edit_message_text("❌ Рассылка отменена.")
+        except BadRequest:
+            pass
+        return
+
+    if _broadcast_lock.locked():
+        await query.answer("⏳ Уже идёт другая рассылка, подожди.", show_alert=True)
+        return
+
+    del _bc_pending[token]
+    await query.answer("Отправляю…")
+    status_msg = query.message
+    try:
+        await status_msg.edit_text(
+            f"📣 Отправляю {pending['label']} в {len(pending['chat_ids'])} "
+            "групп (в фоне)..."
+        )
+    except BadRequest:
+        pass
+
+    sender_id = user.id if user else 0
+    sender_name = user.username if user and user.username else "unknown"
+
+    async def run():
+        async with _broadcast_lock:
+            await _do_broadcast(
+                context, pending["text"], sender_id, sender_name, status_msg,
+                chat_ids=pending["chat_ids"], label=pending["label"],
+            )
+
+    asyncio.create_task(run())
+
+
+# --- Chat title tracking -------------------------------------------------
+# /bc ищет компанию по названию группы в Supabase — держим его актуальным.
+
+async def on_chat_title_changed(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    message = update.message
+    if not message or not message.new_chat_title:
+        return
+    await remember_chat(
+        message.chat_id, title=message.new_chat_title, chat_type=message.chat.type
+    )
+
+
 # --- /dot ----------------------------------------------------------------
 
 DOT_PREFIX_RE = re.compile(r"^🔴[^🔴]*🔴\s*")
+INACTIVE_PREFIX = "❌ INACTIVE ❌"
+INACTIVE_PREFIX_RE = re.compile(r"^\s*❌\s*INACTIVE\s*❌\s*", re.IGNORECASE)
 ENG_MONTHS = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun",
     "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -1105,8 +1395,22 @@ async def cmd_dot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await message.reply_text(f"Couldn't fetch chat title: {e}")
         return
 
-    base_title = DOT_PREFIX_RE.sub("", current_title)
+    # Метку INACTIVE оставляем первой, DOT-дату ставим сразу после неё.
+    inactive = bool(INACTIVE_PREFIX_RE.match(current_title))
+    base_title = DOT_PREFIX_RE.sub("", INACTIVE_PREFIX_RE.sub("", current_title))
     new_title = f"{new_prefix} {base_title}".strip()
+    if inactive:
+        new_title = f"{INACTIVE_PREFIX} {new_title}"
+    await _rename_chat(context, message, chat, current_title, new_title)
+
+
+async def _rename_chat(
+    context: ContextTypes.DEFAULT_TYPE,
+    message: Message,
+    chat: Chat,
+    current_title: str,
+    new_title: str,
+) -> None:
     if len(new_title) > 128:
         new_title = new_title[:128]
 
@@ -1116,6 +1420,7 @@ async def cmd_dot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     for attempt in range(3):
         try:
             await context.bot.set_chat_title(chat.id, new_title)
+            await remember_chat(chat.id, title=new_title, chat_type=chat.type)
             return
         except Forbidden:
             await message.reply_text(NO_PERMISSION_MSG)
@@ -1134,6 +1439,34 @@ async def cmd_dot(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 await message.reply_text(f"❌ Failed to rename: {e}")
                 return
             await asyncio.sleep(1)
+
+
+# --- /inactive -----------------------------------------------------------
+
+async def cmd_inactive(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.message
+    chat = update.effective_chat
+    if not message:
+        return
+    user = update.effective_user
+    if not user or not user.username or user.username.lower() not in INACTIVE_USERNAMES:
+        await message.reply_text(ACCESS_DENIED_MSG)
+        return
+    if not chat or chat.type not in {ChatType.GROUP, ChatType.SUPERGROUP}:
+        await message.reply_text("/inactive only works in groups.")
+        return
+
+    try:
+        chat_full = await context.bot.get_chat(chat.id)
+        current_title = chat_full.title or ""
+    except (Forbidden, BadRequest) as e:
+        await message.reply_text(f"Couldn't fetch chat title: {e}")
+        return
+
+    # Повторный /inactive не дублирует метку.
+    base_title = INACTIVE_PREFIX_RE.sub("", current_title)
+    new_title = f"{INACTIVE_PREFIX} {base_title}".strip()
+    await _rename_chat(context, message, chat, current_title, new_title)
 
 
 # --- Refresh trigger -----------------------------------------------------
@@ -1249,11 +1582,17 @@ def main() -> None:
     app.add_handler(CommandHandler("myid", cmd_myid))
     app.add_handler(CommandHandler("chats", cmd_chats))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("bc", cmd_bc))
+    app.add_handler(CommandHandler("companies", cmd_companies))
     app.add_handler(CommandHandler("dot", cmd_dot))
+    app.add_handler(CommandHandler("inactive", cmd_inactive))
     app.add_handler(CommandHandler("stats", cmd_stats))
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(
         CallbackQueryHandler(on_language_button, pattern=r"^lang:")
+    )
+    app.add_handler(
+        CallbackQueryHandler(on_bc_button, pattern=r"^bc:(ok|no):")
     )
     app.add_handler(
         ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER)
@@ -1267,6 +1606,9 @@ def main() -> None:
     )
     app.add_handler(
         MessageHandler(filters.StatusUpdate.MIGRATE, on_group_migrated)
+    )
+    app.add_handler(
+        MessageHandler(filters.StatusUpdate.NEW_CHAT_TITLE, on_chat_title_changed)
     )
     app.add_error_handler(error_handler)
 
