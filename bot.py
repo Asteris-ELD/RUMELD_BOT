@@ -132,8 +132,7 @@ EXTRA_WELCOME_MESSAGES: list[str] = [
 🚫 Washington (WA)
 🚫 Idaho (ID)
 🚫 Montana (MT)
-🚫 Arizona (AZ)
-🚫 Wyoming (WY)
+
 
 📸 LPR WARNING
 LPR (License Plate Recognition) cameras scan your plate and track truck movement.
